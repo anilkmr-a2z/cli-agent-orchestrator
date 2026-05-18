@@ -1,4 +1,25 @@
-"""Inbox service with watchdog for automatic message delivery."""
+"""Inbox service with watchdog for automatic message delivery.
+
+This module provides the inbox functionality for agent-to-agent communication,
+using file system monitoring to detect when agents become idle and can receive messages.
+
+Architecture:
+- Messages are queued in the database (inbox table) via send_message MCP tool
+- LogFileHandler monitors terminal log files for changes using watchdog
+- When a terminal becomes idle (detected via log patterns), pending messages are delivered
+- Messages are sent via terminal_service.send_input() which types into the tmux pane
+
+Message Flow:
+1. Agent A calls send_message(terminal_id, message) → message queued in DB
+2. Agent B's terminal log file updates (via tmux pipe-pane)
+3. LogFileHandler.on_modified() triggered → checks for pending messages
+4. If terminal is IDLE and has pending messages → deliver via send_input()
+5. Message status updated to DELIVERED or FAILED
+
+Performance Optimization:
+- Uses fast log tail check before expensive tmux status queries
+- Only queries full provider status when idle pattern detected in log
+"""
 
 import logging
 import re
@@ -7,18 +28,29 @@ from pathlib import Path
 
 from watchdog.events import FileModifiedEvent, FileSystemEventHandler
 
-from cli_agent_orchestrator.clients.database import get_pending_messages, update_message_status
-from cli_agent_orchestrator.constants import INBOX_SERVICE_TAIL_LINES, TERMINAL_LOG_DIR
-from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.clients.database import (
+    get_pending_messages,
+    list_pending_receiver_ids_by_provider,
+    update_message_status,
+)
+from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
+from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
 
 logger = logging.getLogger(__name__)
 
 
-def _get_log_tail(terminal_id: str, lines: int = 5) -> str:
-    """Get last N lines from terminal log file."""
+def _get_log_tail(terminal_id: str, lines: int = 100) -> str:
+    """Get last N lines from terminal log file.
+
+    Default of 100 lines covers full-screen TUI providers where the idle
+    prompt sits mid-screen with 30+ padding lines below it.
+    Reading 100 lines via tail is still sub-millisecond.
+    """
     log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
     try:
         result = subprocess.run(
@@ -45,7 +77,9 @@ def _has_idle_pattern(terminal_id: str) -> bool:
         return False
 
 
-def check_and_send_pending_messages(terminal_id: str) -> bool:
+def check_and_send_pending_messages(
+    terminal_id: str, registry: PluginRegistry | None = None
+) -> bool:
     """Check for pending messages and send if terminal is ready.
 
     Args:
@@ -68,15 +102,32 @@ def check_and_send_pending_messages(terminal_id: str) -> bool:
     provider = provider_manager.get_provider(terminal_id)
     if provider is None:
         raise ValueError(f"Provider not found for terminal {terminal_id}")
-    status = provider.get_status(tail_lines=INBOX_SERVICE_TAIL_LINES)
+    # Let the provider use its own default tail_lines. Each provider knows how
+    # many lines it needs to reliably detect the idle prompt (TUI providers
+    # need 50 lines due to TUI padding). Previously this passed
+    # INBOX_SERVICE_TAIL_LINES=5, which was too few for TUI-based providers —
+    # the idle prompt was never found, so messages stayed PENDING forever.
+    status = provider.get_status()
 
     if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
         logger.debug(f"Terminal {terminal_id} not ready (status={status})")
         return False
 
-    # Send message
+    # Send message. Inbox-queued delivery is only reached via the send_message
+    # MCP tool, so the orchestration_type is always "send_message" here — the
+    # synchronous handoff/assign paths bypass the inbox and pass their own
+    # orchestration_type directly to send_input().
     try:
-        terminal_service.send_input(terminal_id, message.message)
+        if registry is None:
+            terminal_service.send_input(terminal_id, message.message)
+        else:
+            terminal_service.send_input(
+                terminal_id,
+                message.message,
+                registry=registry,
+                sender_id=message.sender_id,
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
         update_message_status(message.id, MessageStatus.DELIVERED)
         logger.info(f"Delivered message {message.id} to terminal {terminal_id}")
         return True
@@ -86,8 +137,32 @@ def check_and_send_pending_messages(terminal_id: str) -> bool:
         raise
 
 
+def poll_opencode_pending_messages(registry: PluginRegistry | None = None) -> None:
+    """Poll OpenCode terminals for pending inbox messages.
+
+    This is a temporary OpenCode-specific wakeup path for providers whose
+    pipe-pane logs do not change after the TUI settles. It intentionally reuses
+    the existing delivery helper and inherits its known duplicate-wakeup race
+    with immediate and watchdog delivery paths. GH #115 tracks replacing these
+    paths with a single coordinated delivery engine.
+    """
+    receiver_ids = list_pending_receiver_ids_by_provider(ProviderType.OPENCODE_CLI.value)
+
+    for terminal_id in receiver_ids:
+        try:
+            check_and_send_pending_messages(terminal_id, registry=registry)
+        except Exception as e:
+            logger.debug(f"OpenCode inbox poll failed for {terminal_id}: {e}")
+
+
 class LogFileHandler(FileSystemEventHandler):
     """Handler for terminal log file changes."""
+
+    def __init__(self, registry: PluginRegistry | None = None) -> None:
+        """Initialize the log file handler with an optional plugin registry."""
+
+        super().__init__()
+        self._registry = registry
 
     def on_modified(self, event):
         """Handle file modification events."""
@@ -114,7 +189,7 @@ class LogFileHandler(FileSystemEventHandler):
                 return
 
             # Attempt delivery
-            check_and_send_pending_messages(terminal_id)
+            check_and_send_pending_messages(terminal_id, registry=self._registry)
 
         except Exception as e:
             logger.error(f"Error handling log change for {terminal_id}: {e}")

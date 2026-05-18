@@ -26,6 +26,8 @@ class TerminalModel(Base):
     tmux_window = Column(String, nullable=False)  # "window-name"
     provider = Column(String, nullable=False)  # "q_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
+    allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
+    shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -65,8 +67,32 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db() -> None:
-    """Initialize database tables."""
+    """Initialize database tables and apply schema migrations."""
     Base.metadata.create_all(bind=engine)
+    _migrate_terminals_schema()
+
+
+def _migrate_terminals_schema() -> None:
+    """Add allowed_tools and shell_command columns to terminals table if missing (schema migration)."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        conn = sqlite3.connect(str(DATABASE_FILE))
+        cursor = conn.execute("PRAGMA table_info(terminals)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "allowed_tools" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
+            conn.commit()
+            logger.info("Migration: added allowed_tools column to terminals table")
+        if "shell_command" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
+            conn.commit()
+            logger.info("Migration: added shell_command column to terminals table")
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Migration check for terminals schema failed: {e}")
 
 
 def create_terminal(
@@ -75,8 +101,12 @@ def create_terminal(
     tmux_window: str,
     provider: str,
     agent_profile: Optional[str] = None,
+    allowed_tools: Optional[List[str]] = None,
+    shell_command: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
+    import json as _json
+
     with SessionLocal() as db:
         terminal = TerminalModel(
             id=terminal_id,
@@ -84,6 +114,8 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+            shell_command=shell_command,
         )
         db.add(terminal)
         db.commit()
@@ -93,11 +125,15 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "allowed_tools": allowed_tools,
+            "shell_command": terminal.shell_command,
         }
 
 
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     """Get terminal metadata by ID."""
+    import json as _json
+
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
@@ -106,12 +142,15 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         logger.debug(
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
         )
+        allowed_tools = _json.loads(terminal.allowed_tools) if terminal.allowed_tools else None
         return {
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "allowed_tools": allowed_tools,
+            "shell_command": terminal.shell_command,
             "last_active": terminal.last_active,
         }
 
@@ -142,6 +181,50 @@ def update_last_active(terminal_id: str) -> bool:
             db.commit()
             return True
         return False
+
+
+def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
+    """Update the shell_command baseline for a terminal."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.shell_command = shell_command
+            db.commit()
+            return True
+        return False
+
+
+def list_all_terminals() -> List[Dict[str, Any]]:
+    """List all terminals."""
+    with SessionLocal() as db:
+        terminals = db.query(TerminalModel).all()
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
+
+
+def list_pending_receiver_ids_by_provider(provider: str) -> List[str]:
+    """List receiver terminal IDs with pending messages for a specific provider."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(InboxModel.receiver_id)
+            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                TerminalModel.provider == provider,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .distinct()
+            .all()
+        )
+        return [row[0] for row in rows]
 
 
 def delete_terminal(terminal_id: str) -> bool:
