@@ -38,3 +38,4 @@ class AgentProfile(BaseModel):
     useLegacyMcpJson: Optional[bool] = None
     model: Optional[str] = None
     permissionMode: Optional[PermissionMode] = None
+    native_agent: Optional[str] = None  # Claude Code native agent name (thin-wrapper mode)
